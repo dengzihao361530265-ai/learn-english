@@ -5,6 +5,8 @@ Chrome Manifest V3 扩展：在网页中选中英文后，通过右键菜单翻�
 本地词库。扩展不保存 API Key，翻译请求只由本机 Native Messaging Host
 发起。
 
+项目地址：[https://gitee.com/michaellitea/learn-english](https://gitee.com/michaellitea/learn-english)
+
 ## 功能
 
 - 英文单词与短语录入、自动翻译、搜索、导入和导出
@@ -35,8 +37,8 @@ Chrome Manifest V3 扩展：在网页中选中英文后，通过右键菜单翻�
 ## 从源码运行
 
 ```powershell
-git clone <your-repository-url>
-cd learn_english
+git clone https://gitee.com/michaellitea/learn-english.git
+cd learn-english
 
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
