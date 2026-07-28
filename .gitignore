@@ -1,0 +1,44 @@
+# Local secrets
+.env
+.env.*
+!.env.example
+
+# User data
+words.json
+stats.json
+*.json.lock
+*.lock
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+env/
+
+# Build artifacts
+build/
+dist/
+*.exe
+*.crx
+*.zip
+*.pem
+*.der
+*.key
+native-host-manifest.json
+
+# Editors and local tooling
+.agents/
+.codex/
+.idea/
+.vscode/
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+Desktop.ini
