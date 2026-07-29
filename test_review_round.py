@@ -1,10 +1,11 @@
 import unittest
+from collections import deque
 
 import main
 
 
 class ReviewRoundTests(unittest.TestCase):
-    def test_each_word_is_selected_at_most_once_per_round(self):
+    def make_app(self):
         app = main.App.__new__(main.App)
         app.words = [
             {
@@ -15,19 +16,28 @@ class ReviewRoundTests(unittest.TestCase):
                 "lastReviewed": None,
                 "reviewCount": 0,
             }
-            for index in range(1, 6)
+            for index in range(1, 4)
         ]
-        app._round_remaining = {1, 2, 3, 4, 5}
+        app._round_ids = {1, 2, 3}
+        app._round_queue = deque([1, 2, 3])
+        return app
 
-        selected = []
-        while app._round_remaining:
-            word = app.pick_word()
-            self.assertIsNotNone(word)
-            self.assertNotIn(word["id"], selected)
-            selected.append(word["id"])
-            app._round_remaining.discard(word["id"])
+    def test_unknown_word_moves_to_queue_tail(self):
+        app = self.make_app()
+        app._advance_round_queue(1, known=False)
+        self.assertEqual(list(app._round_queue), [2, 3, 1])
+        self.assertEqual(app.pick_word()["id"], 2)
 
-        self.assertCountEqual(selected, [1, 2, 3, 4, 5])
+    def test_round_ends_only_after_every_word_is_known(self):
+        app = self.make_app()
+
+        app._advance_round_queue(1, known=False)
+        app._advance_round_queue(2, known=True)
+        app._advance_round_queue(3, known=True)
+        self.assertEqual(list(app._round_queue), [1])
+
+        app._advance_round_queue(1, known=True)
+        self.assertEqual(list(app._round_queue), [])
         self.assertIsNone(app.pick_word())
 
 

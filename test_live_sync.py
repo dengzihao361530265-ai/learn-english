@@ -2,6 +2,7 @@ import json
 import os
 import tempfile
 import unittest
+from collections import deque
 
 import main
 
@@ -33,7 +34,7 @@ class LiveSyncTests(unittest.TestCase):
             app.revealed = True
             app._list_dirty = False
             app._round_ids = {1}
-            app._round_remaining = {1}
+            app._round_queue = deque([1])
             app._round_completed = False
             app._word_snapshot = {1: dict(initial[0])}
             app._words_signature = app._get_words_signature()
@@ -61,7 +62,7 @@ class LiveSyncTests(unittest.TestCase):
                 self.assertEqual(app.current["chinese"], "您好")
                 self.assertEqual(calls, {"list": 0, "review": 1})
                 self.assertTrue(app._list_dirty)
-                self.assertEqual(app._round_remaining, {1, 2})
+                self.assertEqual(list(app._round_queue), [1, 2])
             finally:
                 main.WORDS_FILE = original_words_file
 

@@ -21,6 +21,7 @@ import time
 import tkinter as tk
 import urllib.request
 import urllib.error
+from collections import deque
 from contextlib import contextmanager
 from datetime import date, timedelta
 from tkinter import filedialog, messagebox
@@ -304,11 +305,8 @@ class App:
             word.get('id'): dict(word) for word in self.words
             if isinstance(word, dict) and word.get('id') is not None
         }
-        self._round_ids = {
-            word.get('id') for word in self.words
-            if isinstance(word, dict) and word.get('id') is not None
-        }
-        self._round_remaining = set(self._round_ids)
+        self._round_queue = deque(self._build_round_order(self.words))
+        self._round_ids = set(self._round_queue)
         self._round_completed = False
         self._words_signature = self._get_words_signature()
         self.stats = load_json(STATS_FILE, {'total': 0, 'days': {}})
@@ -431,7 +429,8 @@ class App:
                       height=40, width=140,
                       command=lambda: self.grade(True)).pack(side='left', padx=8)
 
-        ctk.CTkLabel(self.review_body, text='空格 显示  ·  回车 认识  ·  ← 没记住  ·  Esc 隐藏',
+        ctk.CTkLabel(self.review_body,
+                     text='空格 显示  ·  回车 认识  ·  ← 没记住（排到队尾）  ·  Esc 隐藏',
                      font=(FONT, 11), text_color='gray60').pack(pady=(2, 8))
 
     def _build_add_tab(self, tab):
@@ -632,11 +631,17 @@ class App:
             if isinstance(word, dict) and word.get('id') is not None
         }
         self._round_ids.intersection_update(incoming_ids)
-        self._round_remaining.intersection_update(incoming_ids)
+        self._round_queue = deque(
+            word_id for word_id in self._round_queue
+            if word_id in incoming_ids
+        )
         if not self._round_completed:
             new_ids = incoming_ids - old_word_ids
             self._round_ids.update(new_ids)
-            self._round_remaining.update(new_ids)
+            self._round_queue.extend(
+                word.get('id') for word in incoming
+                if word.get('id') in new_ids
+            )
         self._word_snapshot = {
             word.get('id'): dict(word) for word in incoming
             if isinstance(word, dict) and word.get('id') is not None
@@ -704,27 +709,38 @@ class App:
         self.stats['total'] = self.stats.get('total', 0) + 1
         self.save_stats()
 
-    def pick_word(self):
-        """从本轮未复习单词中加权选择，确保一轮内每个词只出现一次。"""
-        candidates = [
-            word for word in self.words
-            if word.get('id') in self._round_remaining
+    @staticmethod
+    def _build_round_order(words):
+        """创建新一轮的随机队列。"""
+        word_ids = [
+            word.get('id') for word in words
+            if isinstance(word, dict) and word.get('id') is not None
         ]
-        if not candidates:
-            return None
-        now = time.time() * 1000
-        weights = []
-        for w in candidates:
-            last = w.get('lastReviewed') or w.get('createdAt') or now
-            elapsed = max(1, now - last)
-            weights.append(elapsed ** 1.5)
-        total = sum(weights)
-        r = random.random() * total
-        for i, wgt in enumerate(weights):
-            r -= wgt
-            if r <= 0:
-                return candidates[i]
-        return candidates[-1]
+        random.shuffle(word_ids)
+        return word_ids
+
+    def pick_word(self):
+        """返回队首单词；不会的词会在评分时重新进入队尾。"""
+        words_by_id = {
+            word.get('id'): word for word in self.words
+            if isinstance(word, dict) and word.get('id') is not None
+        }
+        while self._round_queue and self._round_queue[0] not in words_by_id:
+            self._round_queue.popleft()
+        return words_by_id.get(self._round_queue[0]) if self._round_queue else None
+
+    def _advance_round_queue(self, reviewed_id, known):
+        """认识则出队；不会则移到队尾。"""
+        self._round_queue = deque(
+            word_id for word_id in self._round_queue
+            if word_id != reviewed_id
+        )
+        if (
+            not known
+            and reviewed_id in self._round_ids
+            and any(word.get('id') == reviewed_id for word in self.words)
+        ):
+            self._round_queue.append(reviewed_id)
 
     # --------------------------------------------------------------- review
     def _update_mini_button(self):
@@ -738,11 +754,8 @@ class App:
             self.btn_mini.pack_forget()
 
     def start_new_round(self):
-        self._round_ids = {
-            word.get('id') for word in self.words
-            if isinstance(word, dict) and word.get('id') is not None
-        }
-        self._round_remaining = set(self._round_ids)
+        self._round_queue = deque(self._build_round_order(self.words))
+        self._round_ids = set(self._round_queue)
         self._round_completed = False
         self.current = None
         self._update_mini_button()
@@ -780,7 +793,7 @@ class App:
         if self._round_completed and self.words:
             self.review_body.pack_forget()
             self.lbl_round_complete.configure(
-                text=f'本轮已复习 {len(self._round_ids)} 个单词\n可以休息一下了')
+                text=f'本轮已通过 {len(self._round_ids)} 个单词\n可以休息一下了')
             self.review_complete.pack(fill='both', expand=True)
         elif has:
             self.review_empty.pack_forget()
@@ -811,11 +824,11 @@ class App:
         if known:
             self.current['lastReviewed'] = int(time.time() * 1000)
             self.current['reviewCount'] = self.current.get('reviewCount', 0) + 1
-        # 没记住：不更新 lastReviewed，让它继续优先被抽到
-        self._round_remaining.discard(reviewed_id)
+        # 没记住：不更新复习时间，并将它移动到本轮队尾。
+        self._advance_round_queue(reviewed_id, known)
         self.record_review()
         self.save_words()
-        if self._round_remaining:
+        if self._round_queue:
             self.show_word(pick_new=True)
         else:
             self._complete_round()
@@ -887,7 +900,7 @@ class App:
         new_id = self.words[-1]['id']
         if not self._round_completed:
             self._round_ids.add(new_id)
-            self._round_remaining.add(new_id)
+            self._round_queue.append(new_id)
         self.save_words()
         self.entry_en.delete(0, 'end')
         self.entry_cn.delete(0, 'end')
@@ -943,12 +956,14 @@ class App:
             return
         self.words = [w for w in self.words if w['id'] != wid]
         self._round_ids.discard(wid)
-        self._round_remaining.discard(wid)
+        self._round_queue = deque(
+            word_id for word_id in self._round_queue if word_id != wid
+        )
         if self.current and self.current['id'] == wid:
             self.current = None
         self.save_words()
         self.render_list()
-        if self._round_remaining:
+        if self._round_queue:
             self.show_word(pick_new=True)
         elif self.words and self._round_ids:
             self._complete_round()
@@ -988,7 +1003,7 @@ class App:
             })
             if not self._round_completed:
                 self._round_ids.add(word_id)
-                self._round_remaining.add(word_id)
+                self._round_queue.append(word_id)
             added += 1
         self.save_words()
         self.render_list()
