@@ -202,7 +202,8 @@ IDLE 组件。部分精简版或损坏的 Conda 环境可能缺少完整 Tcl/Tk 
 python -m unittest -v `
   test_native_host.py `
   test_live_sync.py `
-  test_review_round.py
+  test_review_round.py `
+  test_list_paging.py
 ```
 
 项目的主要组件：

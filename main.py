@@ -27,7 +27,9 @@ from datetime import date, timedelta
 from tkinter import filedialog, messagebox
 
 import customtkinter as ctk
+import darkdetect
 from dotenv import load_dotenv
+from customtkinter.windows.widgets.appearance_mode import AppearanceModeTracker
 
 try:
     import keyboard  # 全局热键（老板键呼出）
@@ -48,11 +50,19 @@ APP_NAME = '背单词'
 HOTKEY = 'ctrl+alt+w'
 FONT = 'Microsoft YaHei UI'
 REVIEW_ROUND_SIZE = 25
-LIST_PAGE_SIZE = 50
+LIST_PAGE_SIZE = 12
 SEARCH_DEBOUNCE_MS = 180
 
 GREEN = '#2fa572'
 RED = '#e0453a'
+
+
+def initial_appearance_mode():
+    """启动时读取一次系统主题，避免 CustomTkinter 每 30ms 轮询注册表。"""
+    try:
+        return 'dark' if darkdetect.isDark() else 'light'
+    except Exception:
+        return 'light'
 
 
 def resource_path(rel):
@@ -291,7 +301,9 @@ def native_host_loop():
 
 class App:
     def __init__(self):
-        ctk.set_appearance_mode('system')      # 跟随系统深浅色
+        # 保持启动时的系统配色，但不在运行期间高频轮询注册表。
+        AppearanceModeTracker.update_loop_interval = 1000
+        ctk.set_appearance_mode(initial_appearance_mode())
         ctk.set_default_color_theme('blue')
 
         self.win = ctk.CTk()
@@ -328,6 +340,8 @@ class App:
         self._list_rendered = False
         self._list_page = 0
         self._search_after = None
+        self._list_rows = []
+        self._list_prewarm_after = None
         self._sync_stop = threading.Event()
 
         self._build_ui()
@@ -342,6 +356,8 @@ class App:
             daemon=True,
         )
         self._sync_thread.start()
+        self._list_prewarm_after = self.win.after(
+            120, self._prewarm_list_rows)
 
     # ------------------------------------------------------------------ UI
     def _build_ui(self):
@@ -485,6 +501,8 @@ class App:
 
         self.list_frame = ctk.CTkScrollableFrame(tab, corner_radius=10)
         self.list_frame.pack(fill='both', expand=True, padx=10, pady=6)
+        self.list_empty = ctk.CTkLabel(
+            self.list_frame, text='', font=(FONT, 14), text_color='gray60')
 
         bottom = ctk.CTkFrame(tab, fg_color='transparent')
         bottom.pack(fill='x', padx=10, pady=(2, 8))
@@ -923,45 +941,97 @@ class App:
         self._list_page = max(0, self._list_page + delta)
         self.render_list()
 
+    def _create_list_row(self):
+        """创建一个可重复绑定不同单词的列表行。"""
+        row = ctk.CTkFrame(self.list_frame, fg_color='transparent')
+        info = ctk.CTkFrame(row, fg_color='transparent')
+        info.pack(side='left', fill='x', expand=True)
+        head = ctk.CTkFrame(info, fg_color='transparent')
+        head.pack(fill='x')
+        label_en = ctk.CTkLabel(
+            head, text='', font=(FONT, 14, 'bold'), anchor='w')
+        label_en.pack(side='left')
+        label_cn = ctk.CTkLabel(
+            head, text='', font=(FONT, 13),
+            text_color='gray60', anchor='w')
+        label_cn.pack(side='left')
+        label_meta = ctk.CTkLabel(
+            info, text='', font=(FONT, 10), text_color='gray50', anchor='w')
+        label_meta.pack(fill='x')
+        button_delete = ctk.CTkButton(
+            row, text='✕', width=30, height=26, font=(FONT, 12),
+            fg_color='transparent', text_color=RED,
+            hover_color=('#fbeae9', '#3a2221'))
+        button_delete.pack(side='right')
+        return {
+            'row': row,
+            'english': label_en,
+            'chinese': label_cn,
+            'meta': label_meta,
+            'delete': button_delete,
+        }
+
+    def _ensure_list_rows(self, count):
+        while len(self._list_rows) < count:
+            self._list_rows.append(self._create_list_row())
+
+    def _prewarm_list_rows(self):
+        """空闲时逐行准备控件，避免首次切换列表时集中创建。"""
+        self._list_prewarm_after = None
+        if len(self._list_rows) >= LIST_PAGE_SIZE:
+            return
+        self._list_rows.append(self._create_list_row())
+        self._list_prewarm_after = self.win.after(
+            20, self._prewarm_list_rows)
+
+    @staticmethod
+    def _page_word_list(words, keyword, page, page_size=LIST_PAGE_SIZE):
+        keyword = keyword.strip().lower()
+        shown = [
+            word for word in sorted(
+                words, key=lambda item: item.get('createdAt', 0), reverse=True)
+            if (
+                not keyword
+                or keyword in word['english'].lower()
+                or keyword in word['chinese'].lower()
+            )
+        ]
+        page_count = max(1, (len(shown) + page_size - 1) // page_size)
+        page = min(max(0, page), page_count - 1)
+        start = page * page_size
+        return shown, page, page_count, shown[start:start + page_size]
+
     def render_list(self, reset_page=False):
         self._search_after = None
         if reset_page:
             self._list_page = 0
-        for child in self.list_frame.winfo_children():
-            child.destroy()
-
         kw = self.entry_search.get().strip().lower()
-        shown = [w for w in sorted(self.words, key=lambda x: x.get('createdAt', 0), reverse=True)
-                 if not kw or kw in w['english'].lower() or kw in w['chinese'].lower()]
-        page_count = max(1, (len(shown) + LIST_PAGE_SIZE - 1) // LIST_PAGE_SIZE)
-        self._list_page = min(self._list_page, page_count - 1)
-        page_start = self._list_page * LIST_PAGE_SIZE
-        page_words = shown[page_start:page_start + LIST_PAGE_SIZE]
+        shown, self._list_page, page_count, page_words = self._page_word_list(
+            self.words, kw, self._list_page)
 
         if not shown:
-            ctk.CTkLabel(self.list_frame, text='没有匹配的单词' if kw else '还没有单词',
-                         font=(FONT, 14), text_color='gray60').pack(pady=40)
-        for w in page_words:
-            row = ctk.CTkFrame(self.list_frame, fg_color='transparent')
-            row.pack(fill='x', pady=1)
-            info = ctk.CTkFrame(row, fg_color='transparent')
-            info.pack(side='left', fill='x', expand=True)
-            head = ctk.CTkFrame(info, fg_color='transparent')
-            head.pack(fill='x')
-            ctk.CTkLabel(head, text=w['english'], font=(FONT, 14, 'bold'),
-                         anchor='w').pack(side='left')
-            ctk.CTkLabel(head, text='  ' + w['chinese'], font=(FONT, 13),
-                         text_color='gray60', anchor='w').pack(side='left')
-            last = w.get('lastReviewed')
+            self.list_empty.configure(
+                text='没有匹配的单词' if kw else '还没有单词')
+            self.list_empty.pack(pady=40)
+        else:
+            self.list_empty.pack_forget()
+
+        self._ensure_list_rows(len(page_words))
+        for index, slot in enumerate(self._list_rows):
+            if index >= len(page_words):
+                slot['row'].pack_forget()
+                continue
+            word = page_words[index]
+            slot['english'].configure(text=word['english'])
+            slot['chinese'].configure(text='  ' + word['chinese'])
+            last = word.get('lastReviewed')
             meta = (time.strftime('%m/%d %H:%M', time.localtime(last / 1000))
                     if last else '从未复习')
-            ctk.CTkLabel(info, text=f"复习 {w.get('reviewCount', 0)} 次 · 上次 {meta}",
-                         font=(FONT, 10), text_color='gray50',
-                         anchor='w').pack(fill='x')
-            ctk.CTkButton(row, text='✕', width=30, height=26, font=(FONT, 12),
-                          fg_color='transparent', text_color=RED,
-                          hover_color=('#fbeae9', '#3a2221'),
-                          command=lambda wid=w['id']: self.delete_word(wid)).pack(side='right')
+            slot['meta'].configure(
+                text=f"复习 {word.get('reviewCount', 0)} 次 · 上次 {meta}")
+            slot['delete'].configure(
+                command=lambda wid=word['id']: self.delete_word(wid))
+            slot['row'].pack(fill='x', pady=1)
 
         total = len(self.words)
         self.lbl_count.configure(text=f'共 {total} 个单词' +
