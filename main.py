@@ -312,10 +312,6 @@ class App:
         self.stats = load_json(STATS_FILE, {'total': 0, 'days': {}})
         self.current = None        # 当前正在复习的单词
         self.revealed = False      # 当前单词是否已显示中文
-        self.mini = False          # 是否处于迷你模式
-        self.normal_geometry = None
-        self.mini_geometry = None
-        self._drag = None
         self._toast_after = None
         self._list_dirty = False
         self._sync_stop = threading.Event()
@@ -326,7 +322,6 @@ class App:
         self.win.protocol('WM_DELETE_WINDOW', self.on_close)
 
         self.show_word(pick_new=True)
-        self._update_mini_button()
         self._sync_thread = threading.Thread(
             target=self._watch_external_words,
             name='words-file-watcher',
@@ -339,18 +334,13 @@ class App:
         self.main = ctk.CTkFrame(self.win, fg_color='transparent')
         self.main.pack(fill='both', expand=True)
 
-        # 顶栏：标题 + 提示 + 迷你模式按钮
+        # 顶栏：标题 + 快捷键提示
         header = ctk.CTkFrame(self.main, fg_color='transparent')
         header.pack(fill='x', padx=16, pady=(12, 4))
         ctk.CTkLabel(header, text='📖 背单词',
                      font=(FONT, 20, 'bold')).pack(side='left')
         ctk.CTkLabel(header, text=f'Esc 隐藏 · Ctrl+Alt+W 呼出',
                      font=(FONT, 11), text_color='gray60').pack(side='right', padx=(0, 8))
-        self.btn_mini = ctk.CTkButton(
-            header, text='迷你模式', width=80, height=28,
-            font=(FONT, 12), command=self.enter_mini)
-        self.btn_mini.pack(side='right')
-
         # 四个标签页
         self.tabview = ctk.CTkTabview(self.main, corner_radius=12,
                                       segmented_button_selected_color=('#1f6aa5', '#1f6aa5'))
@@ -374,7 +364,6 @@ class App:
         self._build_add_tab(self.tabview.tab('录入'))
         self._build_list_tab(self.tabview.tab('列表'))
         self._build_stats_tab(self.tabview.tab('统计'))
-        self._build_mini_frame()
 
     def _build_review_tab(self, tab):
         self.review_empty = ctk.CTkLabel(tab, text='还没有单词\n去「录入」添加几个吧',
@@ -394,7 +383,7 @@ class App:
             command=self.start_new_round).pack(pady=4)
         ctk.CTkLabel(
             self.review_complete,
-            text='迷你模式已暂停，开始下一轮后会重新启用',
+            text='休息一下，准备好后再开始下一轮',
             font=(FONT, 11), text_color='gray50').pack(pady=10)
 
         self.review_body = ctk.CTkFrame(tab, fg_color='transparent')
@@ -520,38 +509,6 @@ class App:
         self.chart_box = ctk.CTkFrame(chart, fg_color='transparent')
         self.chart_box.pack(fill='x', padx=14, pady=(0, 12))
 
-    def _build_mini_frame(self):
-        """迷你置顶模式：无边框小窗，只留单词和两个评分键。"""
-        self.mini_frame = ctk.CTkFrame(self.win, corner_radius=0, border_width=1,
-                                       border_color='gray40')
-        self.mini_frame.bind('<Button-1>', self._drag_start)
-        self.mini_frame.bind('<B1-Motion>', self._drag_move)
-
-        top = ctk.CTkFrame(self.mini_frame, fg_color='transparent', height=22)
-        top.pack(fill='x')
-        ctk.CTkLabel(top, text='⠿ 拖动', font=(FONT, 10),
-                     text_color='gray50').pack(side='left', padx=6)
-        ctk.CTkButton(top, text='✕', width=22, height=22, font=(FONT, 11),
-                      fg_color='transparent', text_color='gray60', hover_color=('#e8e8e8', '#3a3a3a'),
-                      command=self.exit_mini).pack(side='right', padx=2, pady=2)
-
-        self.mini_en = ctk.CTkLabel(self.mini_frame, text='', font=(FONT, 21, 'bold'),
-                                    cursor='hand2', wraplength=300)
-        self.mini_en.pack(pady=(0, 0))
-        self.mini_en.bind('<Button-1>', lambda e: self.reveal())
-        self.mini_cn = ctk.CTkLabel(self.mini_frame, text='', font=(FONT, 13),
-                                    text_color=('#1f6aa5', '#4c9fe0'), wraplength=300)
-        self.mini_cn.pack()
-
-        row = ctk.CTkFrame(self.mini_frame, fg_color='transparent')
-        row.pack(pady=(4, 8))
-        ctk.CTkButton(row, text='✗', width=44, height=26, font=(FONT, 13),
-                      fg_color='transparent', border_width=1, border_color=RED, text_color=RED,
-                      hover_color=('#fbeae9', '#3a2221'),
-                      command=lambda: self.grade(False)).pack(side='left', padx=4)
-        ctk.CTkButton(row, text='✓', width=44, height=26, font=(FONT, 13),
-                      command=lambda: self.grade(True)).pack(side='left', padx=4)
-
     # ------------------------------------------------------------- shortcuts
     def _bind_shortcuts(self):
         self.win.bind('<space>', lambda e: self._key_reveal())
@@ -565,8 +522,8 @@ class App:
         return isinstance(self.win.focus_get(), (tk.Entry, ctk.CTkEntry))
 
     def _review_context(self):
-        """只有在背单词标签页或迷你模式里，复习快捷键才生效。"""
-        return self.mini or (self.tabview.get() == '背单词')
+        """只有在背单词标签页里，复习快捷键才生效。"""
+        return self.tabview.get() == '背单词'
 
     def _key_reveal(self):
         if not self._in_entry() and self._review_context():
@@ -659,7 +616,6 @@ class App:
             self._list_dirty = False
         else:
             self._list_dirty = True
-        self._update_mini_button()
         self.refresh_review_ui()
 
     def save_words(self):
@@ -743,31 +699,17 @@ class App:
             self._round_queue.append(reviewed_id)
 
     # --------------------------------------------------------------- review
-    def _update_mini_button(self):
-        if not hasattr(self, 'btn_mini'):
-            return
-        available = bool(self.words) and not self._round_completed
-        if available:
-            if not self.btn_mini.winfo_manager():
-                self.btn_mini.pack(side='right')
-        else:
-            self.btn_mini.pack_forget()
-
     def start_new_round(self):
         self._round_queue = deque(self._build_round_order(self.words))
         self._round_ids = set(self._round_queue)
         self._round_completed = False
         self.current = None
-        self._update_mini_button()
         self.show_word(pick_new=True)
 
     def _complete_round(self):
         self.current = None
         self.revealed = False
         self._round_completed = bool(self._round_ids)
-        if self.mini:
-            self.exit_mini()
-        self._update_mini_button()
         self.refresh_review_ui()
 
     def _on_tab_change(self, name=None):
@@ -807,11 +749,6 @@ class App:
         else:
             self.review_body.pack_forget()
             self.review_empty.pack(expand=True, pady=80)
-        if self.mini:
-            self.mini_en.configure(text=self.current['english'] if has else '暂无单词')
-            self.mini_cn.configure(text=(self.current['chinese']
-                                         if (has and self.revealed) else ''))
-
     def reveal(self):
         if self.current and not self.revealed:
             self.revealed = True
@@ -969,7 +906,6 @@ class App:
             self._complete_round()
         else:
             self._round_completed = False
-            self._update_mini_button()
             self.show_word(pick_new=True)
 
     # ---------------------------------------------------------- import/export
@@ -1101,41 +1037,6 @@ class App:
             d -= timedelta(days=1)
         return n
 
-    # ------------------------------------------------------------ mini mode
-    def enter_mini(self):
-        if self.mini or self._round_completed or self.current is None:
-            return
-        self.mini = True
-        self.normal_geometry = self.win.geometry()
-        self.main.pack_forget()
-        self.mini_frame.pack(fill='both', expand=True)
-        self.win.minsize(1, 1)  # 先解除最小尺寸限制，窗口才能缩小
-        self.win.overrideredirect(True)
-        self.win.geometry(self.mini_geometry or '340x150+260+260')
-        self.win.attributes('-topmost', True)
-        self.refresh_review_ui()
-
-    def exit_mini(self):
-        if not self.mini:
-            return
-        self.mini_geometry = self.win.geometry()
-        self.mini = False
-        self.mini_frame.pack_forget()
-        self.main.pack(fill='both', expand=True)
-        self.win.overrideredirect(False)
-        self.win.minsize(520, 600)
-        self.win.attributes('-topmost', False)
-        if self.normal_geometry:
-            self.win.geometry(self.normal_geometry)
-        self.refresh_review_ui()
-
-    def _drag_start(self, e):
-        self._drag = (e.x_root - self.win.winfo_x(), e.y_root - self.win.winfo_y())
-
-    def _drag_move(self, e):
-        if self._drag:
-            self.win.geometry(f'+{e.x_root - self._drag[0]}+{e.y_root - self._drag[1]}')
-
     # ------------------------------------------------------------- boss key
     def _register_hotkey(self):
         if keyboard is None:
@@ -1163,7 +1064,7 @@ class App:
         self.win.lift()
         self.win.focus_force()
         self.win.attributes('-topmost', True)
-        self.win.after(150, lambda: self.win.attributes('-topmost', self.mini))
+        self.win.after(150, lambda: self.win.attributes('-topmost', False))
 
     # ----------------------------------------------------------------- misc
     def _center(self, w, h):
