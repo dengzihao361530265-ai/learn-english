@@ -47,6 +47,9 @@ except OSError:
 APP_NAME = '背单词'
 HOTKEY = 'ctrl+alt+w'
 FONT = 'Microsoft YaHei UI'
+REVIEW_ROUND_SIZE = 25
+LIST_PAGE_SIZE = 50
+SEARCH_DEBOUNCE_MS = 180
 
 GREEN = '#2fa572'
 RED = '#e0453a'
@@ -301,19 +304,30 @@ class App:
         self._center(600, 660)
 
         self.words = load_json(WORDS_FILE, [])
+        self.stats = load_json(STATS_FILE, {'total': 0, 'days': {}})
         self._word_snapshot = {
             word.get('id'): dict(word) for word in self.words
             if isinstance(word, dict) and word.get('id') is not None
         }
-        self._round_queue = deque(self._build_round_order(self.words))
+        previous_missed = self.stats.get('previousRoundMissedIds', [])
+        self._previous_round_missed_ids = (
+            list(dict.fromkeys(previous_missed))
+            if isinstance(previous_missed, list) else []
+        )
+        self._round_queue = deque(self._build_round_order(
+            self.words, self._previous_round_missed_ids
+        ))
         self._round_ids = set(self._round_queue)
+        self._round_missed_ids = []
         self._round_completed = False
         self._words_signature = self._get_words_signature()
-        self.stats = load_json(STATS_FILE, {'total': 0, 'days': {}})
         self.current = None        # 当前正在复习的单词
         self.revealed = False      # 当前单词是否已显示中文
         self._toast_after = None
-        self._list_dirty = False
+        self._list_dirty = True
+        self._list_rendered = False
+        self._list_page = 0
+        self._search_after = None
         self._sync_stop = threading.Event()
 
         self._build_ui()
@@ -467,7 +481,7 @@ class App:
         self.entry_search = ctk.CTkEntry(top, font=(FONT, 13), height=34,
                                          placeholder_text='🔍 搜索单词或翻译…')
         self.entry_search.pack(fill='x')
-        self.entry_search.bind('<KeyRelease>', lambda e: self.render_list())
+        self.entry_search.bind('<KeyRelease>', self._on_search_changed)
 
         self.list_frame = ctk.CTkScrollableFrame(tab, corner_radius=10)
         self.list_frame.pack(fill='both', expand=True, padx=10, pady=6)
@@ -476,6 +490,17 @@ class App:
         bottom.pack(fill='x', padx=10, pady=(2, 8))
         self.lbl_count = ctk.CTkLabel(bottom, text='', font=(FONT, 12), text_color='gray60')
         self.lbl_count.pack(side='left')
+        self.btn_next_page = ctk.CTkButton(
+            bottom, text='下一页', width=58, height=28, font=(FONT, 11),
+            command=lambda: self._change_list_page(1))
+        self.btn_next_page.pack(side='right', padx=(6, 0))
+        self.lbl_page = ctk.CTkLabel(
+            bottom, text='', width=58, font=(FONT, 11), text_color='gray60')
+        self.lbl_page.pack(side='right')
+        self.btn_prev_page = ctk.CTkButton(
+            bottom, text='上一页', width=58, height=28, font=(FONT, 11),
+            command=lambda: self._change_list_page(-1))
+        self.btn_prev_page.pack(side='right', padx=(6, 0))
         ctk.CTkButton(bottom, text='导出', width=64, height=28, font=(FONT, 12),
                       fg_color='transparent', border_width=1, border_color='gray50',
                       text_color=('gray20', 'gray90'),
@@ -575,10 +600,6 @@ class App:
         self._words_signature = signature
         if incoming == self.words:
             return
-        old_word_ids = {
-            word.get('id') for word in self.words
-            if isinstance(word, dict) and word.get('id') is not None
-        }
         current_id = (
             self.current.get('id') if isinstance(self.current, dict) else None
         )
@@ -592,13 +613,19 @@ class App:
             word_id for word_id in self._round_queue
             if word_id in incoming_ids
         )
-        if not self._round_completed:
-            new_ids = incoming_ids - old_word_ids
-            self._round_ids.update(new_ids)
-            self._round_queue.extend(
-                word.get('id') for word in incoming
-                if word.get('id') in new_ids
-            )
+        self._round_missed_ids = [
+            word_id for word_id in self._round_missed_ids
+            if word_id in incoming_ids
+        ]
+        self._previous_round_missed_ids = [
+            word_id for word_id in self._previous_round_missed_ids
+            if word_id in incoming_ids
+        ]
+        if not self._round_ids and incoming and not self._round_completed:
+            self._round_queue = deque(self._build_round_order(
+                incoming, self._previous_round_missed_ids
+            ))
+            self._round_ids = set(self._round_queue)
         self._word_snapshot = {
             word.get('id'): dict(word) for word in incoming
             if isinstance(word, dict) and word.get('id') is not None
@@ -612,7 +639,7 @@ class App:
             self.current = self.pick_word()
             self.revealed = False
         if self.tabview.get() == '列表':
-            self.render_list()
+            self.render_list(reset_page=True)
             self._list_dirty = False
         else:
             self._list_dirty = True
@@ -652,6 +679,7 @@ class App:
                     if isinstance(word, dict) and word.get('id') is not None
                 }
                 self._words_signature = self._get_words_signature()
+                self._list_dirty = True
         except Exception:
             pass
 
@@ -666,14 +694,36 @@ class App:
         self.save_stats()
 
     @staticmethod
-    def _build_round_order(words):
-        """创建新一轮的随机队列。"""
-        word_ids = [
-            word.get('id') for word in words
+    def _build_round_order(
+            words, previous_missed_ids=None, limit=REVIEW_ROUND_SIZE):
+        """错词优先，其余按最久未复习排序，构成有上限的新一轮。"""
+        valid_words = [
+            word for word in words
             if isinstance(word, dict) and word.get('id') is not None
         ]
-        random.shuffle(word_ids)
-        return word_ids
+        words_by_id = {word['id']: word for word in valid_words}
+        previous_missed_ids = previous_missed_ids or []
+        selected = []
+        selected_ids = set()
+
+        for word_id in previous_missed_ids:
+            if word_id in words_by_id and word_id not in selected_ids:
+                selected.append(word_id)
+                selected_ids.add(word_id)
+                if len(selected) >= limit:
+                    return selected
+
+        oldest = sorted(
+            (word for word in valid_words if word['id'] not in selected_ids),
+            key=lambda word: (
+                word.get('lastReviewed') is not None,
+                word.get('lastReviewed') or 0,
+                word.get('createdAt') or 0,
+                word['id'],
+            ),
+        )
+        selected.extend(word['id'] for word in oldest[:limit - len(selected)])
+        return selected
 
     def pick_word(self):
         """返回队首单词；不会的词会在评分时重新进入队尾。"""
@@ -700,8 +750,11 @@ class App:
 
     # --------------------------------------------------------------- review
     def start_new_round(self):
-        self._round_queue = deque(self._build_round_order(self.words))
+        self._round_queue = deque(self._build_round_order(
+            self.words, self._previous_round_missed_ids
+        ))
         self._round_ids = set(self._round_queue)
+        self._round_missed_ids = []
         self._round_completed = False
         self.current = None
         self.show_word(pick_new=True)
@@ -710,12 +763,18 @@ class App:
         self.current = None
         self.revealed = False
         self._round_completed = bool(self._round_ids)
+        self._previous_round_missed_ids = list(self._round_missed_ids)
+        self.stats['previousRoundMissedIds'] = list(
+            self._previous_round_missed_ids
+        )
+        self.save_stats()
         self.refresh_review_ui()
 
     def _on_tab_change(self, name=None):
         name = name or self.tabview.get()
         if name == '列表':
-            self.render_list()
+            if self._list_dirty or not self._list_rendered:
+                self.render_list(reset_page=True)
             self._list_dirty = False
         elif name == '统计':
             self.render_stats()
@@ -761,7 +820,9 @@ class App:
         if known:
             self.current['lastReviewed'] = int(time.time() * 1000)
             self.current['reviewCount'] = self.current.get('reviewCount', 0) + 1
-        # 没记住：不更新复习时间，并将它移动到本轮队尾。
+        elif reviewed_id not in self._round_missed_ids:
+            self._round_missed_ids.append(reviewed_id)
+        # 没记住：记录为本轮错词，不更新复习时间，并移动到队尾。
         self._advance_round_queue(reviewed_id, known)
         self.record_review()
         self.save_words()
@@ -834,11 +895,9 @@ class App:
             'lastReviewed': None,
             'reviewCount': 0,
         })
-        new_id = self.words[-1]['id']
-        if not self._round_completed:
-            self._round_ids.add(new_id)
-            self._round_queue.append(new_id)
         self.save_words()
+        if not self._round_ids and not self._round_completed:
+            self.start_new_round()
         self.entry_en.delete(0, 'end')
         self.entry_cn.delete(0, 'end')
         self.entry_en.focus_set()
@@ -851,18 +910,38 @@ class App:
         self._toast_after = self.win.after(2000, lambda: self.lbl_toast.configure(text=''))
 
     # ----------------------------------------------------------------- list
-    def render_list(self):
+    def _on_search_changed(self, _event=None):
+        """合并连续键盘事件，避免每次按键都重建列表控件。"""
+        if self._search_after:
+            self.win.after_cancel(self._search_after)
+        self._search_after = self.win.after(
+            SEARCH_DEBOUNCE_MS,
+            lambda: self.render_list(reset_page=True),
+        )
+
+    def _change_list_page(self, delta):
+        self._list_page = max(0, self._list_page + delta)
+        self.render_list()
+
+    def render_list(self, reset_page=False):
+        self._search_after = None
+        if reset_page:
+            self._list_page = 0
         for child in self.list_frame.winfo_children():
             child.destroy()
 
         kw = self.entry_search.get().strip().lower()
         shown = [w for w in sorted(self.words, key=lambda x: x.get('createdAt', 0), reverse=True)
                  if not kw or kw in w['english'].lower() or kw in w['chinese'].lower()]
+        page_count = max(1, (len(shown) + LIST_PAGE_SIZE - 1) // LIST_PAGE_SIZE)
+        self._list_page = min(self._list_page, page_count - 1)
+        page_start = self._list_page * LIST_PAGE_SIZE
+        page_words = shown[page_start:page_start + LIST_PAGE_SIZE]
 
         if not shown:
             ctk.CTkLabel(self.list_frame, text='没有匹配的单词' if kw else '还没有单词',
                          font=(FONT, 14), text_color='gray60').pack(pady=40)
-        for w in shown:
+        for w in page_words:
             row = ctk.CTkFrame(self.list_frame, fg_color='transparent')
             row.pack(fill='x', pady=1)
             info = ctk.CTkFrame(row, fg_color='transparent')
@@ -886,13 +965,27 @@ class App:
 
         total = len(self.words)
         self.lbl_count.configure(text=f'共 {total} 个单词' +
-                                 (f' · 筛选出 {len(shown)} 个' if kw else ''))
+                                  (f' · 筛选出 {len(shown)} 个' if kw else ''))
+        self.lbl_page.configure(text=f'{self._list_page + 1}/{page_count}')
+        self.btn_prev_page.configure(
+            state='normal' if self._list_page > 0 else 'disabled')
+        self.btn_next_page.configure(
+            state='normal' if self._list_page + 1 < page_count else 'disabled')
+        self._list_rendered = True
+        self._list_dirty = False
 
     def delete_word(self, wid):
         if not messagebox.askyesno('确认删除', '确定要删除这个单词吗？', parent=self.win):
             return
         self.words = [w for w in self.words if w['id'] != wid]
         self._round_ids.discard(wid)
+        self._round_missed_ids = [
+            word_id for word_id in self._round_missed_ids if word_id != wid
+        ]
+        self._previous_round_missed_ids = [
+            word_id for word_id in self._previous_round_missed_ids
+            if word_id != wid
+        ]
         self._round_queue = deque(
             word_id for word_id in self._round_queue if word_id != wid
         )
@@ -937,12 +1030,11 @@ class App:
                 'english': en, 'chinese': cn,
                 'createdAt': now, 'lastReviewed': None, 'reviewCount': 0,
             })
-            if not self._round_completed:
-                self._round_ids.add(word_id)
-                self._round_queue.append(word_id)
             added += 1
         self.save_words()
-        self.render_list()
+        if not self._round_ids and not self._round_completed:
+            self.start_new_round()
+        self.render_list(reset_page=True)
         messagebox.showinfo('导入完成',
                             f'新增 {added} 个单词，跳过重复 {len(items) - added} 个',
                             parent=self.win)

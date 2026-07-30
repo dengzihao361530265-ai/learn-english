@@ -35,11 +35,16 @@ class LiveSyncTests(unittest.TestCase):
             app._list_dirty = False
             app._round_ids = {1}
             app._round_queue = deque([1])
+            app._round_missed_ids = []
+            app._previous_round_missed_ids = []
             app._round_completed = False
             app._word_snapshot = {1: dict(initial[0])}
             app._words_signature = app._get_words_signature()
             calls = {"list": 0, "review": 0}
-            app.render_list = lambda: calls.__setitem__("list", calls["list"] + 1)
+            app.render_list = (
+                lambda **_kwargs:
+                calls.__setitem__("list", calls["list"] + 1)
+            )
             app.refresh_review_ui = (
                 lambda: calls.__setitem__("review", calls["review"] + 1)
             )
@@ -62,7 +67,7 @@ class LiveSyncTests(unittest.TestCase):
                 self.assertEqual(app.current["chinese"], "您好")
                 self.assertEqual(calls, {"list": 0, "review": 1})
                 self.assertTrue(app._list_dirty)
-                self.assertEqual(list(app._round_queue), [1, 2])
+                self.assertEqual(list(app._round_queue), [1])
             finally:
                 main.WORDS_FILE = original_words_file
 
